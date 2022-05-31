@@ -3,8 +3,17 @@ from collections import defaultdict
 import time
 from urllib.parse import urlparse
 
+import aiofiles
 from aiohttp.client_exceptions import ClientError
 from funcy import decorator
+
+
+@decorator
+async def last_fetch(call):
+    resp = await call()
+    async with aiofiles.open('last_fetch.html', 'w') as f:
+        await f.write(resp.body)
+    return resp
 
 
 @decorator

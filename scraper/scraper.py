@@ -13,7 +13,7 @@ from aiocsv import AsyncWriter
 import parsechain
 from parsechain import C
 
-from middleware import log_fetch, limit, retry
+from middleware import last_fetch, log_fetch, limit, retry
 from utils import arun, amap, write_json
 
 
@@ -26,7 +26,12 @@ MOBILE_ROOT_URL = 'https://m.999.md'
 OUTPUT_FILE_PATH = '../999md_parsing_result.csv'
 
 
-FETCH_LIMIT = 7
+FETCH_LIMIT = 1
+
+
+scraped_products_urls = set()
+
+users = {}
 
 
 def main():
@@ -39,14 +44,21 @@ async def scrape_products():
             'Название',
             'Ссылка',
             'Цена',
-            'Телефон',
-            'Имя'
+            'Телефоны',
+            'Username',
+            'Тип',
+            'Локация',
+            'Описание'
         ),
         flag='w'
     )
+    # await scrape_product('https://m.999.md/ru/75587315')
+    # await scrape_user('https://m.999.md/ru/profile/www-fluture-md')
+    # return
     page = await fetch(ROOT_URL + '/ru/')
     main_categories_urls = page.css('.main-CatalogNavigation a[data-category]').attrs('href').map(page.abs)
-    await amap(scrape_products_by_category, main_categories_urls)
+    for category_url in main_categories_urls:
+        await scrape_products_by_category(category_url)
 
 
 async def scrape_products_by_category(category_url):
@@ -55,7 +67,8 @@ async def scrape_products_by_category(category_url):
         url.split('?')[0]
         for url in page.css('.category__subCategories-collection a[data-category]').attrs('href').map(page.abs)
     ))
-    await amap(scrape_products_by_subcategory, subcategories_urls)
+    for url in subcategories_urls:
+        await scrape_products_by_subcategory(url)
 
 
 async def scrape_products_by_subcategory(category_url):
@@ -78,73 +91,95 @@ async def scrape_products_by_subcategory(category_url):
         f'{category_url}&page={page}'
         for page in range(2, total_pages + 1)
     ]
-    pprint(page_urls)
 
-    # await scrape_page_products(category_url)
-    # await amap(scrape_page_products, page_urls)
+    await parse_page_products(page)
+    for url in page_urls:
+        await scrape_page_products(url)
 
 
 async def scrape_page_products(category_url):
     page = await fetch(category_url)
+    await parse_page_products(page)
+
+
+async def parse_page_products(page):
     urls = [MOBILE_ROOT_URL + href for href in page.css('.ads-list-photo-item-animated-link').attrs('href')]
-    await amap(scrape_product, urls)
+    for url in urls:
+        await scrape_product(url)
 
 
-async def scrape_product(product_url):
+async def scrape_product(product_url, product_data=None):
+    global scraped_products_urls, users
+    if product_url in scraped_products_urls:
+        return
+    scraped_products_urls.add(product_url)
+    
+    if product_data is None:
+        product_data = {}
+
     page = await fetch(product_url)
-    data = page.root.multi({
-        'url': C.const(product_url),
+    product_data.update(page.root.multi({
+        'url': C.const(page.url),
         'title': C.css('.item-page__meta__title').first.text.strip(),
-        'price': C.css('.item-page__meta__price-feature__prices__price__value').first.text.strip(),
-        'phone': C.css('.item-page__author-info__item_phone').map(lambda el: el.text).first,
-        'username': C.css('.item-page__author-info__item_user').first.text.strip(),
-        'location': C.css('.item-page__author-info_marker span').first.text.strip()
-    })
-    await save_product(data)
+        'location': C.css('.item-page__author-info_marker span').first.text.strip(),
+        'user_type': C.css('.item-page__meta--header__type').first.text,
+        'description': C.css('.item-page__info__text').first.inner_text.strip()
+    }))
+
+    for div in page.css('.item-page__meta__price-feature__prices__price'):
+        if div.cssselect('[content=EUR]'):
+            try:
+                product_data['price'] = ''.join(div.cssselect('[itemprop=price]')[0].text.replace('≈', '').split())
+            except Exception:
+                pass
+    el = page.css('.item-page__author-info__item_user').first
+    product_data['username'] = el.text.strip()
+    user_url = page.abs(el.get('href'))
+    if user_url not in users:
+        users[user_url] = await scrape_user(user_url)
+    product_data.update(users[user_url])
+
+    await save_product(product_data)
+
+
+async def scrape_user(user_url):
+    page = await fetch(user_url)
+    phones = []
+    for el in page.css('.user-profile__tab-contacts__phone'):
+        phones.append(el.get('href').replace('tel:', ''))
+
+    user_data = {
+        'phones': '\n'.join(phones),
+    }
+    return user_data
 
 
 async def save_product(data):
+    if not data.get('phones'):
+        return
+
     await write_to_csv((
         data['title'],
         data['url'],
-        data['price'],
-        data.get('phone') or '',
-        data.get('username') or ''
+        data.get('price'),
+        data['phones'],
+        data['username'],
+        data['user_type'],
+        data['location'],
+        data.get('description')
     ))
 
 
 async def write_to_csv(data, flag='a'):
-    async with aiofiles.open(OUTPUT_FILE_PATH, flag) as f:
-        writer = AsyncWriter(f)
+    async with aiofiles.open(OUTPUT_FILE_PATH, flag, encoding='utf-8', newline='') as f:
+        writer = AsyncWriter(f, delimiter=';', dialect='excel', quoting=csv.QUOTE_MINIMAL)
         await writer.writerow(data)
-
-
-
-def get_categories_urls():
-    soup = get_soup(ROOT_URL + '/ru/')
-    categories = [
-        {'name': a.text, 'url': ROOT_URL + a.get('href')}
-        for a in soup.find(class_='main-CatalogNavigation').findAll('a', {'data-category': True})
-    ]
-    links = []
-    for cat in categories:
-        soup = get_soup(cat['url'])
-        for div in soup.findAll(class_='category__subCategories-collection'):
-            links += div.findAll('a', {'data-subcategory': True}, recursive=False)
-
-    return links
-
-
-# def write_to_csv(data, flag='a'):
-#     # with open(OUTPUT_FILE_PATH, flag, newline='', encoding='utf-8-sig') as f:
-#     #     writer = csv.writer(f, delimiter=';', dialect='excel', quoting=csv.QUOTE_MINIMAL)
-#     #     writer.writerow(data)
-#     pass
 
 
 @limit(per_domain=FETCH_LIMIT)
 @retry()
 @log_fetch
+# @last_fetch
 async def fetch(url, method='get', data=None, cookies=None, proxy=None):
     async with aiohttp.ClientSession(cookies=cookies, timeout=aiohttp.ClientTimeout(total=60), headers=BASE_HEADERS) as s:
         async with getattr(s, method)(url, data=data, proxy=proxy) as resp:
